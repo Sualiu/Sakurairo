@@ -12,9 +12,21 @@ function get_chatgpt_api_info(){?>
             <h2><?php _e('System Information', 'sakurairo'); ?></h2>
             <p><strong><?php _e('ChatGPT API Settings Status', 'sakurairo'); ?></strong></p>
             <pre style="background:#eee; padding:10px; overflow:auto;">
-<?php _e('API Endpoint: ', 'sakurairo'); ?><?php echo esc_html(iro_opt('chatgpt_endpoint', __('Not set', 'sakurairo'))); ?>
-<?php _e('API Key: ', 'sakurairo'); ?><?php echo empty(iro_opt('chatgpt_access_token')) ? esc_html__('Not set', 'sakurairo') : esc_html(__('Set (Length: ', 'sakurairo') . strlen(iro_opt('chatgpt_access_token')) . ')'); ?>
-<?php _e('Model: ', 'sakurairo'); ?><?php echo esc_html(iro_opt('chatgpt_model', __('Not set', 'sakurairo'))); ?>
+<?php
+// iro_opt() 返回值类型不固定，统一做类型保护
+$chatgpt_endpoint = iro_opt('chatgpt_endpoint', __('Not set', 'sakurairo'));
+$chatgpt_token = iro_opt('chatgpt_access_token', '');
+$chatgpt_model = iro_opt('chatgpt_model', __('Not set', 'sakurairo'));
+if (!is_string($chatgpt_endpoint)) {
+    $chatgpt_endpoint = __('Not set', 'sakurairo');
+}
+if (!is_string($chatgpt_model)) {
+    $chatgpt_model = __('Not set', 'sakurairo');
+}
+?>
+<?php _e('API Endpoint: ', 'sakurairo'); ?><?php echo esc_html($chatgpt_endpoint); ?>
+<?php _e('API Key: ', 'sakurairo'); ?><?php echo (empty($chatgpt_token) || !is_string($chatgpt_token)) ? esc_html__('Not set', 'sakurairo') : esc_html(sprintf(__('Set (Length: %d)', 'sakurairo'), strlen($chatgpt_token))); ?>
+<?php _e('Model: ', 'sakurairo'); ?><?php echo esc_html($chatgpt_model); ?>
             </pre>
         </div>
         <?php

@@ -70,7 +70,7 @@ function get_smilies_panel() {
 <?php if (comments_open()) : ?>
 <section id="comments" class="comments">
     <!-- 评论区域标题及折叠通知 -->
-    <div class="commentwrap comments-hidden<?php echo esc_attr(iro_opt('comment_area')) == 'fold' ? ' comments-fold' : ''; ?>">
+    <div class="commentwrap comments-hidden<?php echo esc_attr(iro_opt('comment_area', 'unfold')) == 'fold' ? ' comments-fold' : ''; ?>">
             <div class="notification">
                 <i class="fa-regular fa-comment"></i><?php _e('view comments', 'sakurairo'); /*查看评论*/?> -
                 <span class="noticom">
@@ -177,14 +177,14 @@ function get_smilies_panel() {
                 'title_reply'       => '',
                 'title_reply_to'    => '<div class="graybar"><i class="fa-regular fa-comment"></i>' . __('Leave a Reply to', 'sakurairo') . ' %s</div>',
                 'cancel_reply_link' => __('Cancel Reply', 'sakurairo'),
-                'label_submit'      => esc_attr(iro_opt('comment_submit_button_text')),
+                'label_submit'      => esc_attr(iro_opt('comment_submit_button_text', __('Submit', 'sakurairo'))),
                 'comment_field'     => '<div class="comment-textarea">
-                                            <textarea placeholder="' . esc_attr(iro_opt('comment_placeholder_text')) . '" name="comment" class="commentbody" id="comment" rows="5" tabindex="4"></textarea>
-                                            <label class="input-label">' . esc_html(iro_opt('comment_placeholder_text')) . '</label>
+                                            <textarea placeholder="' . esc_attr(iro_opt('comment_placeholder_text', '')) . '" name="comment" class="commentbody" id="comment" rows="5" tabindex="4"></textarea>
+                                            <label class="input-label">' . esc_html(iro_opt('comment_placeholder_text', '')) . '</label>
                                         </div>' . $smilies_box . 
                                         '<div id="upload-img-show"></div>',
                 'submit_button'     => '<div class="form-submit">
-                                            <input name="submit" type="submit" id="submit" class="submit" value=" ' . esc_attr(iro_opt('comment_submit_button_text')) . ' ">' . $smilies_button . $img_upload .'
+                                            <input name="submit" type="submit" id="submit" class="submit" value=" ' . esc_attr(iro_opt('comment_submit_button_text', __('Submit', 'sakurairo'))) . ' ">' . $smilies_button . $img_upload .'
                                             <label class="markdown-toggle">
                                                 <input type="checkbox" id="enable_markdown" name="enable_markdown">
                                                 <i class="fa-brands fa-markdown fa-sm"></i>
