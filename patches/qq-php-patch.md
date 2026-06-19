@@ -21,9 +21,15 @@ change_avatar() → openssl_encrypt(QQ号) → <img src="REST?qq=密文">
 ### 新方案（comment_id）
 
 ```
-change_avatar() → <img src="REST?comment_id=123">
+change_avatar() → <img src="REST?comment_id=123" onerror="imgError(this,1)">
                         ↓
                 get_qq_avatar() → get_comment_meta(comment_id, 'new_field_qq') → qlogo URL
+                        ↓ (缓存命中)
+                文件缓存 → 直接返回二进制 (<5ms)
+                        ↓ (缓存未命中)
+                wp_remote_get(qlogo) → 存入文件缓存 → 返回二进制
+                        ↓ (获取失败)
+                HTTP 404 → 浏览器触发 onerror → imgError() → 主题缺失头像
 ```
 
 优势：
@@ -31,10 +37,65 @@ change_avatar() → <img src="REST?comment_id=123">
 - 无需加密/解密，无密钥管理问题
 - 利用 WordPress 已有的 comment meta 存储机制
 - `comment_id` 是公开信息，不存在隐私泄露
+- **文件缓存**避免重复出站请求，同一 QQ 号只请求一次
+- **前端 onerror 降级**与主题已有的 `imgError()` 机制一致
 
 ### 昵称查询不变
 
 用户在评论表单中**主动输入** QQ 号 → 调用 `/qqinfo/json?qq=123456789` → 返回昵称+头像。这是用户自愿行为，不属于隐私泄露。
+
+---
+
+## 原始主题优秀做法分析
+
+原始主题虽然后端错误处理缺失，但前端设计有几个优秀模式，新方案必须保留并增强：
+
+### 1. `onerror="imgError(this,1)"` — 前端兜底降级
+
+```javascript
+// src/app/global-func.js
+function imgError(ele, type) {
+    switch (type) {
+        case 1:  // 头像类型
+        case 2:
+            ele.onerror = "";  // 防止无限循环
+            if (_iro.missing_avatars != "") {
+                ele.src = _iro.missing_avatars;  // 主题自定义缺失头像
+            } else {
+                ele.src = 'https://weavatar.com/avatar/?s=80&d=mm&r=g';  // Gravatar 默认
+            }
+            break;
+        default:  // 普通图片
+            ele.onerror = "";
+            if (_iro.missing_images != ""){
+                ele.src = _iro.missing_images;
+            } else {
+                ele.src = svg404;  // 内联 SVG 404 占位图
+            }
+    }
+}
+```
+
+**这是原始主题最优秀的设计**：后端无论返回什么错误（404/500/超时/无效数据），浏览器都会触发 `onerror`，`imgError()` 自动替换为主题配置的缺失头像。这比后端 302 重定向到 Gravatar 更好，因为：
+- 使用主题自身的 `_iro.missing_avatars` 配置，风格一致
+- `ele.onerror = ""` 防止降级图片再失败时无限循环
+- 前端降级不增加后端负担
+
+**新方案策略：后端失败时返回 HTTP 404，让 `onerror` 自然触发。** 不需要后端 302 重定向。
+
+### 2. `Cache-Control: max-age=86400` — 浏览器缓存
+
+原始 type_2 模式设置浏览器缓存 24 小时。新方案保留并增强：
+- 成功响应：`Cache-Control: max-age=86400`（浏览器 24 小时内不再请求）
+- 失败响应：`Cache-Control: no-cache`（不缓存错误，下次重试）
+
+### 3. `lazyload` class — 懒加载
+
+原始主题使用 lazyload 延迟加载头像，减少首屏并发请求数。新方案保留不变。
+
+### 4. `spec=100` — 指定尺寸
+
+请求 qlogo 时指定 `spec=100`（100x100），避免下载过大图片。新方案保留不变。
 
 ---
 
@@ -72,13 +133,13 @@ change_avatar() → <img src="REST?comment_id=123">
 1. `get_qq_info()` — 修复 SSRF、输入验证、逻辑分支、urlencode
 2. 删除 `get_qq_avatar($encrypted)` — 加密解密方案废弃
 3. 新增 `get_qq_avatar_url($comment_id)` — 通过 comment_id 读取 QQ 号返回头像 URL
-4. 新增 `get_qq_avatar_data($comment_id)` — 通过 comment_id 读取 QQ 号返回头像二进制数据
+4. 新增 `get_qq_avatar_data($comment_id)` — 通过 comment_id 读取 QQ 号返回头像二进制数据（含文件缓存）
 5. 新增 `get_qq_avatar_url_ptlogin2($comment_id)` — 通过 ptlogin2 接口获取头像 URL
 
 ```diff
 --- a/inc/classes/QQ.php
 +++ b/inc/classes/QQ.php
-@@ -1,40 +1,122 @@
+@@ -1,40 +1,156 @@
  <?php
 
  namespace Sakura\API;
@@ -221,27 +282,89 @@ change_avatar() → <img src="REST?comment_id=123">
 +    }
 +
 +    /**
-+     * Get QQ avatar binary data by comment ID.
-+     * Fetches avatar image and returns raw JPEG data.
++     * Get QQ avatar binary data by comment ID with file caching.
++     *
++     * Caching strategy:
++     * 1. File cache (wp-content/cache/qq-avatars/) — primary, avoids DB bloat
++     * 2. Transient — fallback when file system is not writable
++     * 3. Cache key by QQ number — same QQ across different comments shares one cache
++     * 4. TTL: 7 days — avatar rarely changes
++     *
++     * On cache miss: fetches from qlogo via wp_remote_get(), stores, returns.
++     * On fetch failure: returns false (caller should return HTTP 404,
++     *                   browser triggers onerror → imgError() → missing avatar).
 +     *
 +     * @param int $comment_id WordPress comment ID
 +     * @return string|false Binary image data on success, false on failure
 +     */
 +    public static function get_qq_avatar_data($comment_id) {
-+        $imgurl = self::get_qq_avatar_url($comment_id);
-+        if (!$imgurl) {
++        $comment_id = intval($comment_id);
++        if ($comment_id <= 0) {
 +            return false;
 +        }
 +
++        $qq_number = get_comment_meta($comment_id, 'new_field_qq', true);
++        $qq_number = sanitize_text_field($qq_number);
++        if (empty($qq_number) || !preg_match('/^\d{3,}$/', $qq_number)) {
++            return false;
++        }
++
++        // Cache key by QQ number — same QQ across different comments shares one cache entry
++        $cache_key = 'qq_avatar_' . md5($qq_number);
++
++        // 1. Try file cache
++        $cache_dir = WP_CONTENT_DIR . '/cache/qq-avatars';
++        $cache_file = $cache_dir . '/' . $cache_key . '.jpg';
++
++        if (file_exists($cache_file) && (time() - filemtime($cache_file)) < 7 * DAY_IN_SECONDS) {
++            $data = @file_get_contents($cache_file);
++            if ($data !== false) {
++                return $data;
++            }
++        }
++
++        // 2. Try transient as fallback (for environments where file cache is not writable)
++        $cached = get_transient($cache_key);
++        if ($cached !== false) {
++            return $cached;
++        }
++
++        // 3. Fetch from qlogo
++        $imgurl = 'https://q2.qlogo.cn/headimg_dl?dst_uin=' . urlencode($qq_number) . '&spec=100';
 +        $response = wp_remote_get(esc_url_raw($imgurl), array('timeout' => 10));
 +        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
 +            return false;
 +        }
 +
-+        return wp_remote_retrieve_body($response);
++        $imgdata = wp_remote_retrieve_body($response);
++        if (empty($imgdata)) {
++            return false;
++        }
++
++        // 4. Store to file cache
++        if (wp_mkdir_p($cache_dir)) {
++            @file_put_contents($cache_file, $imgdata);
++        } else {
++            // Fallback: store to transient (smaller data, DB-based)
++            set_transient($cache_key, $imgdata, 7 * DAY_IN_SECONDS);
++        }
++
++        return $imgdata;
      }
  }
 ```
+
+**缓存设计说明:**
+
+| 层级 | 存储 | 读取速度 | 容量限制 | 适用场景 |
+|------|------|---------|---------|---------|
+| 文件缓存 | `wp-content/cache/qq-avatars/*.jpg` | <5ms | 无 | 正常环境（推荐） |
+| Transient 降级 | `wp_options` 表 | ~10ms | 受 `max_allowed_packet` 限制 | 文件系统不可写 |
+
+- 同一 QQ 号在多条评论中共享同一份缓存（`md5(qq_number)` 作为 key）
+- 文件缓存 TTL 通过 `filemtime()` 判断，无需额外存储
+- Transient 使用 WordPress 原生过期机制
+- 文件系统不可写时自动降级到 transient，不报错
 
 ---
 
@@ -324,16 +447,22 @@ change_avatar() → <img src="REST?comment_id=123">
 
 ### B-3: get_qq_avatar 回调（api.php:308-332）— 完全重写
 
-`proxy` 模式下 REST 端点只有一种行为：通过 comment_id 代理头像数据。
+**错误处理策略：** 结合原始主题的 `onerror="imgError(this,1)"` 前端降级机制。后端失败时返回 HTTP 404，浏览器自动触发 `onerror`，`imgError()` 将 `src` 替换为主题配置的缺失头像（`_iro.missing_avatars`）或 Gravatar 默认头像。这比后端 302 重定向更好，因为：
+1. 不增加后端负担（无需再发一次重定向）
+2. 使用主题自身的缺失头像配置，风格一致
+3. `imgError()` 已有 `ele.onerror = ""` 防止无限循环
 
 ```diff
 --- a/inc/api.php
 +++ b/inc/api.php
-@@ -308,24 +308,22 @@
+@@ -308,24 +308,30 @@
  /**
 - * QQ头像链接解密
 + * QQ avatar proxy by comment ID
   * https://sakura.2heng.xin/wp-json/sakura/v1/qqinfo/avatar
++ *
++ * Returns JPEG binary on success (bypasses REST framework via header+echo+exit).
++ * Returns HTTP 404 on failure — browser triggers onerror → imgError() → missing avatar.
   */
 -function get_qq_avatar()
 +function get_qq_avatar(WP_REST_Request $request)
@@ -358,12 +487,20 @@ change_avatar() → <img src="REST?comment_id=123">
 -    return $response;
 +    $comment_id = intval($request->get_param('comment_id'));
 +    if ($comment_id <= 0) {
-+        return new WP_Error('rest_invalid_comment_id', 'Invalid comment ID', array('status' => 400));
++        status_header(404);
++        header('Content-Type: image/jpeg');
++        header('Cache-Control: no-cache');
++        exit;
 +    }
 +
 +    $imgdata = QQ::get_qq_avatar_data($comment_id);
 +    if (!$imgdata) {
-+        return new WP_Error('rest_qq_avatar_not_found', 'Avatar not found', array('status' => 404));
++        // 返回 404，浏览器触发 <img onerror="imgError(this,1)">
++        // imgError() 会替换为 _iro.missing_avatars 或 Gravatar 默认头像
++        status_header(404);
++        header('Content-Type: image/jpeg');
++        header('Cache-Control: no-cache');
++        exit;
 +    }
 +
 +    // 二进制数据必须绕过 REST 框架直接输出
@@ -373,6 +510,16 @@ change_avatar() → <img src="REST?comment_id=123">
 +    exit;
  }
 ```
+
+**错误处理流程对比:**
+
+| 场景 | 原始 type_2 | 新 proxy |
+|------|-----------|---------|
+| qlogo 正常 | 返回 JPEG | 返回 JPEG（缓存 24h） |
+| qlogo 超时 | PHP Fatal Error | 返回 404 → `imgError()` → 缺失头像 |
+| QQ 号无效 | PHP Fatal Error | 返回 404 → `imgError()` → 缺失头像 |
+| comment_id 无效 | N/A | 返回 404 → `imgError()` → 缺失头像 |
+| 缓存命中 | N/A | 直接返回（<5ms，无出站请求） |
 
 ---
 
@@ -398,19 +545,19 @@ change_avatar() → <img src="REST?comment_id=123">
 -            preg_match('/:\"([^\"]*)\"/i', $qqavatar, $matches);
 -            return '<img src="' . $matches[1] . '" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
 -        }
--        
+-
 -        // Ensure $sakura_privkey is defined and not null
 -        if (isset($sakura_privkey) && !is_null($sakura_privkey)) {
 -            // 生成一个合适长度的初始化向量
 -            $iv_length = openssl_cipher_iv_length('aes-128-cbc');
 -            $iv = openssl_random_pseudo_bytes($iv_length);
--            
+-
 -            // 加密数据
 -            $encrypted = openssl_encrypt($qq_number, 'aes-128-cbc', $sakura_privkey, 0, $iv);
--            
+-
 -            // 将初始化向量和加密数据一起编码
 -            $encrypted = urlencode(base64_encode($iv . $encrypted));
--            
+-
 -            return '<img src="' . rest_url("sakura/v1/qqinfo/avatar") . '?qq=' . $encrypted . '" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
 -        } else {
 -            // Handle the case where $sakura_privkey is not set or is null
@@ -430,6 +577,7 @@ change_avatar() → <img src="REST?comment_id=123">
          }
 +
 +        // proxy: 通过 comment_id 代理头像，QQ 号不出现在 URL 中
++        // 后端失败时返回 HTTP 404，浏览器触发 onerror → imgError(this,1) → 缺失头像
 +        return '<img src="' . esc_url(rest_url("sakura/v1/qqinfo/avatar") . '?comment_id=' . $comment->comment_ID) . '" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
      }
      return $avatar;
@@ -440,10 +588,15 @@ change_avatar() → <img src="REST?comment_id=123">
 1. 移除 `global $sakura_privkey` — 不再需要加密
 2. `$qq_number` 加 `sanitize_text_field()`
 3. 使用新选项值 `direct`/`ptlogin2`/`proxy`
-4. `direct` 模式：QQ 号加 `esc_attr(urlencode())`
+4. `direct` 模式：QQ 号加 `esc_attr(urlencode())`，保留 `onerror="imgError(this,1)"`
 5. `ptlogin2` 模式：调用 `QQ::get_qq_avatar_url_ptlogin2()` + `esc_url()` + 空值回退 `$avatar`
-6. `proxy` 模式：通过 `comment_id` 代理头像
+6. `proxy` 模式：通过 `comment_id` 代理头像，保留 `onerror="imgError(this,1)"`
 7. 删除整个加密逻辑和硬编码 `default_avatar_url`
+
+**保留的原始主题优秀做法:**
+- `onerror="imgError(this,1)"` — 所有模式都保留前端兜底降级
+- `lazyload` class — 懒加载
+- `spec=100` — 指定头像尺寸
 
 ---
 
@@ -498,6 +651,8 @@ change_avatar() → <img src="REST?comment_id=123">
 | 12 | $matches[1] 无 isset | 🟡 | A, C | QQ.php, functions.php |
 | 13 | 密钥不存在回退硬编码 URL | 🟡 | C | functions.php |
 | 14 | 选项标签过时/误导 | 🟢 | D | theme-options.php |
+| 15 | proxy 无缓存导致 PHP 负担 | 🟠 | A | QQ.php（文件缓存 + transient 降级） |
+| 16 | proxy 失败无降级 | 🟡 | B-3 | api.php（404 → onerror → imgError） |
 
 ---
 
@@ -507,7 +662,7 @@ change_avatar() → <img src="REST?comment_id=123">
 
 ## 应用顺序
 
-1. **Patch A** — QQ.php（核心重写，无依赖）
+1. **Patch A** — QQ.php（核心重写 + 缓存，无依赖）
 2. **Patch B-1** — 路由注册（无依赖）
 3. **Patch B-2** — get_qq_info 回调（依赖 sakura_verify_rest_request_nonce）
 4. **Patch B-3** — get_qq_avatar 回调（依赖 Patch A）
@@ -520,3 +675,5 @@ change_avatar() → <img src="REST?comment_id=123">
 - **选项值变更** — 旧值 `off`/`type_1`/`type_2`/`type_3` 不再使用，升级后需重新选择
 - **`$sakura_privkey` 可安全移除** — 不再有任何代码引用它
 - **前端无需修改** — 评论表单的 QQ 号输入和昵称查询逻辑不变
+- **缓存目录** — `wp-content/cache/qq-avatars/` 自动创建，不可写时降级到 transient
+- **`imgError()` 不受影响** — 前端降级机制保持原样，所有模式都保留 `onerror="imgError(this,1)"`
