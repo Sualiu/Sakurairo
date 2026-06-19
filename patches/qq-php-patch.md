@@ -285,14 +285,13 @@ function imgError(ele, type) {
 +     * Get QQ avatar binary data by comment ID with file caching.
 +     *
 +     * Caching strategy:
-+     * 1. File cache (wp-content/cache/qq-avatars/) — primary, avoids DB bloat
-+     * 2. Transient — fallback when file system is not writable
-+     * 3. Cache key by QQ number — same QQ across different comments shares one cache
-+     * 4. TTL: 7 days — avatar rarely changes
++     * 1. File cache (wp-content/cache/qq-avatars/) — avoids DB bloat
++     * 2. Cache key by QQ number — same QQ across different comments shares one cache
++     * 3. TTL: 7 days — avatar rarely changes
 +     *
 +     * On cache miss: fetches from qlogo via wp_remote_get(), stores, returns.
-+     * On fetch failure: returns false (caller should return HTTP 404,
-+     *                   browser triggers onerror → imgError() → missing avatar).
++     * On fetch failure or file cache unavailable: returns false
++     *     (caller returns HTTP 404, browser triggers onerror → imgError() → missing avatar).
 +     *
 +     * @param int $comment_id WordPress comment ID
 +     * @return string|false Binary image data on success, false on failure
@@ -310,12 +309,11 @@ function imgError(ele, type) {
 +        }
 +
 +        // Cache key by QQ number — same QQ across different comments shares one cache entry
-+        $cache_key = 'qq_avatar_' . md5($qq_number);
-+
-+        // 1. Try file cache
++        $cache_key = md5($qq_number);
 +        $cache_dir = WP_CONTENT_DIR . '/cache/qq-avatars';
 +        $cache_file = $cache_dir . '/' . $cache_key . '.jpg';
 +
++        // 1. Try file cache (7 day TTL)
 +        if (file_exists($cache_file) && (time() - filemtime($cache_file)) < 7 * DAY_IN_SECONDS) {
 +            $data = @file_get_contents($cache_file);
 +            if ($data !== false) {
@@ -323,13 +321,7 @@ function imgError(ele, type) {
 +            }
 +        }
 +
-+        // 2. Try transient as fallback (for environments where file cache is not writable)
-+        $cached = get_transient($cache_key);
-+        if ($cached !== false) {
-+            return $cached;
-+        }
-+
-+        // 3. Fetch from qlogo
++        // 2. Fetch from qlogo
 +        $imgurl = 'https://q2.qlogo.cn/headimg_dl?dst_uin=' . urlencode($qq_number) . '&spec=100';
 +        $response = wp_remote_get(esc_url_raw($imgurl), array('timeout' => 10));
 +        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
@@ -341,13 +333,12 @@ function imgError(ele, type) {
 +            return false;
 +        }
 +
-+        // 4. Store to file cache
++        // 3. Store to file cache (best-effort, failure is non-fatal)
 +        if (wp_mkdir_p($cache_dir)) {
 +            @file_put_contents($cache_file, $imgdata);
-+        } else {
-+            // Fallback: store to transient (smaller data, DB-based)
-+            set_transient($cache_key, $imgdata, 7 * DAY_IN_SECONDS);
 +        }
++        // File cache unavailable — return data anyway, just without caching.
++        // Next request will fetch from qlogo again. Browser Cache-Control still helps.
 +
 +        return $imgdata;
      }
@@ -356,15 +347,15 @@ function imgError(ele, type) {
 
 **缓存设计说明:**
 
-| 层级 | 存储 | 读取速度 | 容量限制 | 适用场景 |
-|------|------|---------|---------|---------|
-| 文件缓存 | `wp-content/cache/qq-avatars/*.jpg` | <5ms | 无 | 正常环境（推荐） |
-| Transient 降级 | `wp_options` 表 | ~10ms | 受 `max_allowed_packet` 限制 | 文件系统不可写 |
+| 存储 | 读取速度 | 容量限制 | 说明 |
+|------|---------|---------|------|
+| 文件缓存 `wp-content/cache/qq-avatars/*.jpg` | <5ms | 无 | 首选，7 天 TTL |
+| 无缓存（文件系统不可写） | N/A | N/A | 每次从 qlogo 获取，浏览器 `Cache-Control` 仍可缓解 |
 
-- 同一 QQ 号在多条评论中共享同一份缓存（`md5(qq_number)` 作为 key）
+- 同一 QQ 号在多条评论中共享同一份缓存（`md5(qq_number)` 作为文件名）
 - 文件缓存 TTL 通过 `filemtime()` 判断，无需额外存储
-- Transient 使用 WordPress 原生过期机制
-- 文件系统不可写时自动降级到 transient，不报错
+- 文件系统不可写时：不缓存，直接返回数据，下次请求重新获取 qlogo
+- **不使用 Transient 存储二进制数据**，避免 `wp_options` 表膨胀
 
 ---
 
@@ -675,5 +666,5 @@ function imgError(ele, type) {
 - **选项值变更** — 旧值 `off`/`type_1`/`type_2`/`type_3` 不再使用，升级后需重新选择
 - **`$sakura_privkey` 可安全移除** — 不再有任何代码引用它
 - **前端无需修改** — 评论表单的 QQ 号输入和昵称查询逻辑不变
-- **缓存目录** — `wp-content/cache/qq-avatars/` 自动创建，不可写时降级到 transient
+- **缓存目录** — `wp-content/cache/qq-avatars/` 自动创建，不可写时不缓存（每次重新获取，浏览器 `Cache-Control` 仍可缓解）
 - **`imgError()` 不受影响** — 前端降级机制保持原样，所有模式都保留 `onerror="imgError(this,1)"`
