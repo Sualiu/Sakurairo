@@ -624,6 +624,66 @@ function imgError(ele, type) {
 
 ---
 
+## Patch E: functions.php — 选项值迁移
+
+旧用户升级时，数据库中 `iro_options['qq_avatar_link']` 仍为旧值（`off`/`type_1`/`type_2`/`type_3`），新代码不认识这些值会走默认 `direct`，**静默改变用户配置**。
+
+遵循主题现有的迁移模式（`version_compare` + `transient` 确保只执行一次），添加迁移函数：
+
+```diff
+--- a/functions.php
++++ b/functions.php
+@@ -987,6 +987,30 @@
+
+ visual_resource_updates('2.5.6', 'vision_resource_basepath', '3.0/');
+
++/**
++ * Migrate qq_avatar_link option from old values to new values.
++ * Runs once on theme upgrade, then never again.
++ *
++ * Mapping:
++ *   off    → direct    (same behavior: direct qlogo URL)
++ *   type_1 → proxy     (was redirect via encrypted URL, now proxy via comment_id)
++ *   type_2 → proxy     (was backend fetch with encrypted URL, now proxy via comment_id)
++ *   type_3 → ptlogin2  (was ptlogin2 parse, same behavior, new name)
++ */
++function qq_avatar_link_migration() {
++    $triggered = get_transient('qq_avatar_link_migrated');
++    if ($triggered) {
++        return;
++    }
++
++    $old_value = iro_opt('qq_avatar_link');
++    $map = array('off' => 'direct', 'type_1' => 'proxy', 'type_2' => 'proxy', 'type_3' => 'ptlogin2');
++
++    if (isset($map[$old_value])) {
++        iro_opt_update('qq_avatar_link', $map[$old_value]);
++    }
++
++    set_transient('qq_avatar_link_migrated', true, 30 * DAY_IN_SECONDS);
++}
++add_action('after_setup_theme', 'qq_avatar_link_migration');
++
+ function unlisted_avatar_updates() {
+```
+
+**迁移映射:**
+
+| 旧值 | 新值 | 理由 |
+|------|------|------|
+| `off` | `direct` | 行为一致：直接拼接 qlogo URL |
+| `type_1` | `proxy` | 原本就是隐藏 QQ 号（加密重定向），proxy 同样隐藏 |
+| `type_2` | `proxy` | 原本就是隐藏 QQ 号（后端获取二进制），proxy 同样隐藏 |
+| `type_3` | `ptlogin2` | 行为一致：通过 ptlogin2 获取头像 URL |
+| 无值/其他 | 不处理 | `iro_opt()` 的 `$default` 参数会返回 `direct` |
+
+**安全保障:**
+- `transient` 确保迁移只执行一次
+- 已是新值的用户不会触发迁移（`$map` 中无匹配）
+- 30 天后 transient 过期，但此时值已是新值，`$map` 无匹配，不会重复迁移
+
+---
+
 ## 修复问题与 Patch 映射
 
 | # | 问题 | 严重程度 | Patch | 文件 |
@@ -642,8 +702,9 @@ function imgError(ele, type) {
 | 12 | $matches[1] 无 isset | 🟡 | A, C | QQ.php, functions.php |
 | 13 | 密钥不存在回退硬编码 URL | 🟡 | C | functions.php |
 | 14 | 选项标签过时/误导 | 🟢 | D | theme-options.php |
-| 15 | proxy 无缓存导致 PHP 负担 | 🟠 | A | QQ.php（文件缓存 + transient 降级） |
+| 15 | proxy 无缓存导致 PHP 负担 | 🟠 | A | QQ.php（文件缓存） |
 | 16 | proxy 失败无降级 | 🟡 | B-3 | api.php（404 → onerror → imgError） |
+| 17 | 旧选项值无迁移 | 🟡 | E | functions.php（一次性迁移） |
 
 ---
 
@@ -659,11 +720,12 @@ function imgError(ele, type) {
 4. **Patch B-3** — get_qq_avatar 回调（依赖 Patch A）
 5. **Patch C** — change_avatar（依赖 Patch A + B-3）
 6. **Patch D** — 选项定义（必须与 Patch C 同步应用，否则选项值不匹配）
+7. **Patch E** — 选项值迁移（依赖 Patch C + D，确保新代码已就位）
 
 ## 兼容性说明
 
 - **数据库无变更** — comment meta 中的 `new_field_qq` 字段不变，无需迁移
-- **选项值变更** — 旧值 `off`/`type_1`/`type_2`/`type_3` 不再使用，升级后需重新选择
+- **选项值变更** — 旧值自动迁移（Patch E）：`off`→`direct`，`type_1`/`type_2`→`proxy`，`type_3`→`ptlogin2`
 - **`$sakura_privkey` 可安全移除** — 不再有任何代码引用它
 - **前端无需修改** — 评论表单的 QQ 号输入和昵称查询逻辑不变
 - **缓存目录** — `wp-content/cache/qq-avatars/` 自动创建，不可写时不缓存（每次重新获取，浏览器 `Cache-Control` 仍可缓解）
