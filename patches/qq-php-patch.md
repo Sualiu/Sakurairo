@@ -40,27 +40,29 @@ change_avatar() → <img src="REST?comment_id=123">
 
 ## 主题选项变更
 
-### 旧选项（4 种模式）
+### 旧选项
 
 | 值 | 标签 | 行为 | QQ 号暴露 |
 |---|------|------|----------|
-| `off` | Off | 直接拼接 QQ 号到 qlogo URL | ✅ HTML 源码可见 |
-| `type_1` | Redirect (low security) | 加密后重定向到 qlogo URL | ❌ URL 中是密文 |
-| `type_2` | Get avatar data in backend (medium) | 加密后后端获取头像二进制 | ❌ URL 中是密文 |
-| `type_3` | Parse avatar interface (high, slow) | 后端解析 ptlogin2 接口 | ✅ HTML 可见（URL 含 QQ 号） |
+| `off` | Off | 直接拼接 QQ 号到 qlogo URL | ✅ |
+| `type_1` | Redirect (low security) | 加密后重定向到 qlogo URL | ❌ 密文 |
+| `type_2` | Get avatar data in backend (medium) | 加密后后端获取头像二进制 | ❌ 密文 |
+| `type_3` | Parse avatar interface (high, slow) | 后端解析 ptlogin2 接口 | ✅ URL 含 QQ 号 |
 
-### 新选项（3 种模式）
+### 新选项
 
 | 值 | 标签 | 行为 | QQ 号暴露 |
 |---|------|------|----------|
-| `off` | Off | 直接拼接 QQ 号到 qlogo URL | ✅ HTML 可见 |
-| `type_1` | Proxy via comment ID | 通过 comment_id 后端代理头像，QQ 号不出现在任何 URL 中 | ❌ |
-| `type_3` | Direct (ptlogin2 fallback) | 通过 ptlogin2 接口获取头像 URL，CDN 兼容性更好 | ✅ HTML 可见 |
+| `direct` | Direct | 直接拼接 qlogo URL | ✅ |
+| `ptlogin2` | Direct (ptlogin2 fallback) | 通过 ptlogin2 接口获取头像 URL，CDN 兼容性更好 | ✅ |
+| `proxy` | Proxy via comment ID | 通过 comment_id 后端代理头像，QQ 号不出现在任何 URL 中 | ❌ |
 
 **变更说明:**
-- `type_1`/`type_2` 合并为 `type_1`，统一用代理模式（后端获取头像数据直接返回），QQ 号不暴露
-- `type_3` 重新定位为 `off` 的备用选项：同样 QQ 号暴露，但通过 ptlogin2 接口获取头像 URL，可解决部分网络环境下 qlogo CDN 不可用的问题
-- 删除旧的加密逻辑和 `$sakura_privkey` 依赖
+- 使用全新语义化值名，不沿用旧值
+- `off` → `direct`：语义更明确
+- `type_3` → `ptlogin2`：直接描述实现方式
+- `type_1`+`type_2` → `proxy`：合并为代理模式
+- 默认值从 `off` 改为 `direct`
 
 ---
 
@@ -71,11 +73,12 @@ change_avatar() → <img src="REST?comment_id=123">
 2. 删除 `get_qq_avatar($encrypted)` — 加密解密方案废弃
 3. 新增 `get_qq_avatar_url($comment_id)` — 通过 comment_id 读取 QQ 号返回头像 URL
 4. 新增 `get_qq_avatar_data($comment_id)` — 通过 comment_id 读取 QQ 号返回头像二进制数据
+5. 新增 `get_qq_avatar_url_ptlogin2($comment_id)` — 通过 ptlogin2 接口获取头像 URL
 
 ```diff
 --- a/inc/classes/QQ.php
 +++ b/inc/classes/QQ.php
-@@ -1,40 +1,97 @@
+@@ -1,40 +1,122 @@
  <?php
 
  namespace Sakura\API;
@@ -161,9 +164,8 @@ change_avatar() → <img src="REST?comment_id=123">
 -            return 'https://q2.qlogo.cn/headimg_dl?dst_uin=' . $matches[0] . '&spec=100';
 -        }
 +    /**
-+     * Get QQ avatar URL by comment ID.
++     * Get QQ avatar URL by comment ID (qlogo direct).
 +     * Reads QQ number from comment meta, returns qlogo URL.
-+     * QQ number never appears in any URL.
 +     *
 +     * @param int $comment_id WordPress comment ID
 +     * @return string|false Avatar URL on success, false on failure
@@ -184,8 +186,43 @@ change_avatar() → <img src="REST?comment_id=123">
 +    }
 +
 +    /**
++     * Get QQ avatar URL by comment ID (ptlogin2 fallback).
++     * Uses ptlogin2 API to resolve avatar URL, better CDN compatibility.
++     *
++     * @param int $comment_id WordPress comment ID
++     * @return string|false Avatar URL on success, false on failure
++     */
++    public static function get_qq_avatar_url_ptlogin2($comment_id) {
++        $comment_id = intval($comment_id);
++        if ($comment_id <= 0) {
++            return false;
++        }
++
++        $qq_number = get_comment_meta($comment_id, 'new_field_qq', true);
++        $qq_number = sanitize_text_field($qq_number);
++        if (empty($qq_number) || !preg_match('/^\d{3,}$/', $qq_number)) {
++            return false;
++        }
++
++        $response = wp_remote_get(
++            'https://ptlogin2.qq.com/getface?appid=1006102&imgtype=3&uin=' . urlencode($qq_number),
++            array('timeout' => 5)
++        );
++        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
++            return false;
++        }
++
++        $body = wp_remote_retrieve_body($response);
++        if (!preg_match('/:\"([^\"]*)\"/i', $body, $matches) || empty($matches[1])) {
++            return false;
++        }
++
++        return esc_url_raw($matches[1]);
++    }
++
++    /**
 +     * Get QQ avatar binary data by comment ID.
-+     * Fetches avatar image from qlogo and returns raw JPEG data.
++     * Fetches avatar image and returns raw JPEG data.
 +     *
 +     * @param int $comment_id WordPress comment ID
 +     * @return string|false Binary image data on success, false on failure
@@ -246,8 +283,6 @@ change_avatar() → <img src="REST?comment_id=123">
      );
 ```
 
-**变更:** `/qqinfo/avatar` 参数从 `qq`（加密字符串）改为 `comment_id`（整数）
-
 ### B-2: get_qq_info 回调（api.php:284-306）
 
 ```diff
@@ -289,7 +324,7 @@ change_avatar() → <img src="REST?comment_id=123">
 
 ### B-3: get_qq_avatar 回调（api.php:308-332）— 完全重写
 
-type_1/type_2 合并后，REST 端点只有一种行为：通过 comment_id 代理头像数据。
+`proxy` 模式下 REST 端点只有一种行为：通过 comment_id 代理头像数据。
 
 ```diff
 --- a/inc/api.php
@@ -332,20 +367,12 @@ type_1/type_2 合并后，REST 端点只有一种行为：通过 comment_id 代�
 +    }
 +
 +    // 二进制数据必须绕过 REST 框架直接输出
-+    header('Content-Type' => 'image/jpeg');
-+    header('Cache-Control' => 'max-age=86400');
++    header('Content-Type: image/jpeg');
++    header('Cache-Control: max-age=86400');
 +    echo $imgdata;
 +    exit;
  }
 ```
-
-**变更:**
-- 参数从 `$_GET["qq"]` → `$request->get_param('comment_id')`
-- 删除 type_1/type_2 分支判断，统一用代理模式（`QQ::get_qq_avatar_data()`）
-- `file_get_contents($imgurl)` → `QQ::get_qq_avatar_data()` (内部用 `wp_remote_get`)
-- 二进制输出绕过 REST 框架（`header()` + `echo` + `exit`）
-- 错误响应用 `WP_Error`
-- 删除 301/302 重定向分支（代理模式下不需要）
 
 ---
 
@@ -363,14 +390,12 @@ type_1/type_2 合并后，REST 端点只有一种行为：通过 comment_id 代�
      if ($comment && get_comment_meta($comment->comment_ID, 'new_field_qq', true)) {
 -        $qq_number = get_comment_meta($comment->comment_ID, 'new_field_qq', true);
 +        $qq_number = sanitize_text_field(get_comment_meta($comment->comment_ID, 'new_field_qq', true));
-         if (iro_opt('qq_avatar_link') == 'off') {
+-        if (iro_opt('qq_avatar_link') == 'off') {
 -            return '<img src="https://q2.qlogo.cn/headimg_dl?dst_uin=' . $qq_number . '&spec=100" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
-+            return '<img src="https://q2.qlogo.cn/headimg_dl?dst_uin=' . esc_attr(urlencode($qq_number)) . '&spec=100" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
-         }
-         if (iro_opt('qq_avatar_link') == 'type_3') {
+-        }
+-        if (iro_opt('qq_avatar_link') == 'type_3') {
 -            $qqavatar = file_get_contents('http://ptlogin2.qq.com/getface?appid=1006102&imgtype=3&uin=' . $qq_number);
-+            $qqavatar = wp_remote_retrieve_body(wp_remote_get('https://ptlogin2.qq.com/getface?appid=1006102&imgtype=3&uin=' . urlencode($qq_number)));
-             preg_match('/:\"([^\"]*)\"/i', $qqavatar, $matches);
+-            preg_match('/:\"([^\"]*)\"/i', $qqavatar, $matches);
 -            return '<img src="' . $matches[1] . '" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
 -        }
 -        
@@ -390,14 +415,21 @@ type_1/type_2 合并后，REST 端点只有一种行为：通过 comment_id 代�
 -        } else {
 -            // Handle the case where $sakura_privkey is not set or is null
 -            return '<img src="default_avatar_url" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
-+            $avatar_url = isset($matches[1]) ? esc_url($matches[1]) : '';
-+            if (empty($avatar_url)) {
++        $mode = iro_opt('qq_avatar_link', 'direct');
++
++        if ($mode === 'direct') {
++            return '<img src="https://q2.qlogo.cn/headimg_dl?dst_uin=' . esc_attr(urlencode($qq_number)) . '&spec=100" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
++        }
++
++        if ($mode === 'ptlogin2') {
++            $avatar_url = QQ::get_qq_avatar_url_ptlogin2($comment->comment_ID);
++            if (!$avatar_url) {
 +                return $avatar;
 +            }
-+            return '<img src="' . $avatar_url . '" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
++            return '<img src="' . esc_url($avatar_url) . '" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
          }
 +
-+        // type_1: 通过 comment_id 代理头像，QQ 号不出现在 URL 中
++        // proxy: 通过 comment_id 代理头像，QQ 号不出现在 URL 中
 +        return '<img src="' . esc_url(rest_url("sakura/v1/qqinfo/avatar") . '?comment_id=' . $comment->comment_ID) . '" class="lazyload avatar avatar-24 photo" alt="😀" width="24" height="24" onerror="imgError(this,1)">';
      }
      return $avatar;
@@ -407,14 +439,15 @@ type_1/type_2 合并后，REST 端点只有一种行为：通过 comment_id 代�
 **变更:**
 1. 移除 `global $sakura_privkey` — 不再需要加密
 2. `$qq_number` 加 `sanitize_text_field()`
-3. `off` 模式：QQ 号加 `esc_attr(urlencode())`
-4. `type_3` 模式：`file_get_contents('http://...')` → `wp_remote_get('https://...')` + `urlencode` + `isset($matches[1])` + `esc_url()` + 空值回退 `$avatar`
-5. `type_1`/`type_2` 合并：**删除整个加密逻辑**，统一改为 `comment_id` 参数的代理模式
-6. 密钥不存在时的硬编码 `default_avatar_url` → 回退原 `$avatar`
+3. 使用新选项值 `direct`/`ptlogin2`/`proxy`
+4. `direct` 模式：QQ 号加 `esc_attr(urlencode())`
+5. `ptlogin2` 模式：调用 `QQ::get_qq_avatar_url_ptlogin2()` + `esc_url()` + 空值回退 `$avatar`
+6. `proxy` 模式：通过 `comment_id` 代理头像
+7. 删除整个加密逻辑和硬编码 `default_avatar_url`
 
 ---
 
-## Patch D: opt/options/theme-options.php — 选项标签更新
+## Patch D: opt/options/theme-options.php — 选项重写
 
 ```diff
 --- a/opt/options/theme-options.php
@@ -426,21 +459,24 @@ type_1/type_2 合并后，REST 端点只有一种行为：通过 comment_id 代�
 -        'title' => __('QQ Avatar Link Encryption','sakurairo_csf'),
 +        'title' => __('QQ Avatar Link Mode','sakurairo_csf'),
          'options' => array(
-           'off' => __('Off','sakurairo_csf'),
+-          'off' => __('Off','sakurairo_csf'),
 -          'type_1' => __('Redirect (low security)','sakurairo_csf'),
 -          'type_2' => __('Get avatar data in the backend (medium security)','sakurairo_csf'),
 -          'type_3' => __('Parse avatar interface in the backend (high security, slow)','sakurairo_csf'),
-+          'type_1' => __('Proxy via comment ID (QQ number hidden)','sakurairo_csf'),
-+          'type_3' => __('Direct via ptlogin2 (fallback for off)','sakurairo_csf'),
++          'direct' => __('Direct (QQ number visible)','sakurairo_csf'),
++          'ptlogin2' => __('Direct via ptlogin2 (QQ number visible, better CDN compatibility)','sakurairo_csf'),
++          'proxy' => __('Proxy via comment ID (QQ number hidden)','sakurairo_csf'),
          ),
-         'default' => 'off'
+-        'default' => 'off'
++        'default' => 'direct'
        ),
 ```
 
 **变更:**
 - 标题从"Encryption"改为"Mode"
-- `type_1`/`type_2` 合并为 `type_1`，标签改为"Proxy via comment ID (QQ number hidden)"
-- `type_3` 标签改为"Direct via ptlogin2 (fallback for off)"，明确其定位为 off 的备用选项
+- 选项值全部使用新语义化名称
+- 标签明确标注 QQ 号是否可见
+- 默认值从 `off` 改为 `direct`
 
 ---
 
@@ -459,7 +495,7 @@ type_1/type_2 合并后，REST 端点只有一种行为：通过 comment_id 代�
 | 9 | type_2 二进制输出损坏 | 🟠 | B-3 | api.php |
 | 10 | 错误响应应用 WP_Error | 🟠 | B-3 | api.php |
 | 11 | XSS: QQ 号输出未转义 | 🟡 | C | functions.php |
-| 12 | $matches[1] 无 isset | 🟡 | C | functions.php |
+| 12 | $matches[1] 无 isset | 🟡 | A, C | QQ.php, functions.php |
 | 13 | 密钥不存在回退硬编码 URL | 🟡 | C | functions.php |
 | 14 | 选项标签过时/误导 | 🟢 | D | theme-options.php |
 
@@ -475,12 +511,12 @@ type_1/type_2 合并后，REST 端点只有一种行为：通过 comment_id 代�
 2. **Patch B-1** — 路由注册（无依赖）
 3. **Patch B-2** — get_qq_info 回调（依赖 sakura_verify_rest_request_nonce）
 4. **Patch B-3** — get_qq_avatar 回调（依赖 Patch A）
-5. **Patch C** — change_avatar（依赖 Patch B-3，否则 REST 端点参数不匹配）
-6. **Patch D** — 选项标签（无依赖，可随时应用）
+5. **Patch C** — change_avatar（依赖 Patch A + B-3）
+6. **Patch D** — 选项定义（必须与 Patch C 同步应用，否则选项值不匹配）
 
 ## 兼容性说明
 
 - **数据库无变更** — comment meta 中的 `new_field_qq` 字段不变，无需迁移
-- **选项值变更** — `type_2` 被移除，已选择 `type_2` 的用户会回退到默认值 `off`；如需隐藏 QQ 号应改选 `type_1`
+- **选项值变更** — 旧值 `off`/`type_1`/`type_2`/`type_3` 不再使用，升级后需重新选择
 - **`$sakura_privkey` 可安全移除** — 不再有任何代码引用它
 - **前端无需修改** — 评论表单的 QQ 号输入和昵称查询逻辑不变
